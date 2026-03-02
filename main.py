@@ -20,8 +20,7 @@ import secrets
 import hashlib
 import hmac
 from pathlib import Path
-import openai
-from openai.error import AuthenticationError, RateLimitError, APIConnectionError, APIError, OpenAIError
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 
@@ -80,7 +79,6 @@ REQUIRED_COLUMNS = ['campaign_name', 'impressions', 'clicks', 'spend', 'conversi
 # ---------------------------- المفتاح السري للتوقيع والتشفير ----------------------------
 SECRET_KEY = os.environ.get("ADINSIGHT_SECRET_KEY", "SuperSecretKey-ChangeThisInProduction").encode()
 
-# إعداد مفتاح Fernet للتشفير (مشتق من SECRET_KEY)
 def get_fernet_key():
     key_bytes = hashlib.sha256(SECRET_KEY).digest()
     return base64.urlsafe_b64encode(key_bytes)
@@ -94,7 +92,6 @@ def ensure_data_dir():
     CLIENT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def save_client_data_encrypted(data):
-    """حفظ بيانات العميل مشفرة في الملف."""
     ensure_data_dir()
     json_bytes = json.dumps(data).encode('utf-8')
     encrypted = fernet.encrypt(json_bytes)
@@ -102,7 +99,6 @@ def save_client_data_encrypted(data):
         f.write(encrypted)
 
 def load_client_data_encrypted():
-    """تحميل بيانات العميل من الملف المشفر، وإنشاء بيانات افتراضية إذا لم يوجد."""
     ensure_data_dir()
     if CLIENT_DATA_PATH.exists():
         try:
@@ -111,9 +107,7 @@ def load_client_data_encrypted():
             json_bytes = fernet.decrypt(encrypted)
             return json.loads(json_bytes.decode('utf-8'))
         except Exception as e:
-            # فشل فك التشفير، ننشئ بيانات افتراضية جديدة
             print(f"تحذير: فشل فك تشفير بيانات الترخيص: {e}")
-    # بيانات افتراضية للنسخة التجريبية
     first_use = datetime.datetime.now().isoformat()
     default_data = {
         "email": "",
@@ -482,7 +476,6 @@ def export_excel_with_summary(df_clean, user_password=None):
         ws_detail.protection.formatCells = True
         ws_detail.protection.enable()
 
-        # 2️⃣ إنشاء ورقة Summary
         summary_data = {
             'المقياس': ['إجمالي مرات الظهور', 'إجمالي النقرات', 'إجمالي الإنفاق', 'إجمالي التحويلات', 'إجمالي الإيرادات', 'متوسط CTR', 'متوسط CPC', 'متوسط CPA', 'متوسط ROAS'],
             'القيمة': [
@@ -525,16 +518,13 @@ def export_excel_with_summary(df_clean, user_password=None):
 
         ws_summary.protection.enable()
 
-        # تعيين كلمة المرور للورقتين
         if ws_detail.max_row > 1:
             if user_password:
                 password = user_password
             else:
                 password = uuid.uuid4().hex[:8]
-
             ws_detail.protection.set_password(password)
             ws_summary.protection.set_password(password)
-
             if not user_password:
                 st.info(f"🔐 تم حماية ملف Excel بكلمة مرور عشوائية: `{password}`\nاحتفظ بها لأنها لن تظهر مرة أخرى.")
             else:
@@ -549,12 +539,18 @@ def export_excel_with_summary(df_clean, user_password=None):
     output.seek(0)
     return output
 
+# ---------------------------- دالة توليد الملخص الذكي (محدثة لمكتبة OpenAI v1.0.0+) ----------------------------
 def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
-    if 'api_key_encrypted' not in st.session_state:
+    """
+    توليد الملخص التنفيذي والتوصيات عبر OpenAI API.
+    متوافق مع الإصدار 1.0.0+ من مكتبة OpenAI.
+    """
+    api_key = st.session_state.get('api_key')
+    if not api_key:
         return None, None, "❌ مفتاح API غير موجود."
 
-    api_key = decrypt_key(st.session_state['api_key_encrypted'])
-    openai.api_key = api_key
+    # إنشاء عميل OpenAI مع timeout
+    client = OpenAI(api_key=api_key, timeout=30)
 
     prompt = f"""
 أنت خبير تسويق رقمي. بناءً على إحصائيات الحملات التالية، أكتب:
@@ -581,7 +577,7 @@ def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
     attempt = 0
     while attempt < max_retries:
         try:
-            response = openai.ChatCompletion.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": "أنت مساعد خبير في التسويق الرقمي."},
@@ -589,9 +585,14 @@ def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
                 ],
                 temperature=0.7,
                 max_tokens=600,
-                request_timeout=30
             )
+
+            # التحقق من وجود choices والمحتوى (تحسين دفاعي)
+            if not response.choices:
+                raise ValueError("❌ استجابة OpenAI فارغة أو غير متوقعة.")
             content = response.choices[0].message.content.strip()
+            if not content:
+                raise ValueError("❌ محتوى الاستجابة فارغ.")
 
             if "===" in content:
                 parts = content.split("===")
@@ -601,31 +602,24 @@ def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
                 summary_text = content
                 recommendations_text = ""
 
-            if not summary_text:
-                raise ValueError("الاستجابة من OpenAI فارغة.")
-
             return summary_text, recommendations_text, None
 
         except AuthenticationError:
             return None, None, "❌ فشل المصادقة: تحقق من مفتاح API."
         except RateLimitError:
             attempt += 1
-            if attempt < max_retries:
-                sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(sleep_time)
-            else:
-                return None, None, "⚠️ تم تجاوز الحد المسموح للطلبات. حاول لاحقاً."
+            if attempt >= max_retries:
+                return None, None, "⚠️ تم تجاوز الحد المسموح للطلبات."
+            sleep_time = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(sleep_time)
         except APIConnectionError:
             attempt += 1
-            if attempt < max_retries:
-                sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(sleep_time)
-            else:
+            if attempt >= max_retries:
                 return None, None, "⚠️ فشل الاتصال بـ OpenAI بعد عدة محاولات."
+            sleep_time = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(sleep_time)
         except APIError:
             return None, None, "⚠️ خطأ في خوادم OpenAI. حاول مرة أخرى لاحقاً."
-        except OpenAIError as e:
-            return None, None, f"⚠️ خطأ في OpenAI API: {e}"
         except Exception as e:
             return None, None, f"⚠️ خطأ غير متوقع: {e}"
 
@@ -799,9 +793,8 @@ def generate_pdf_report(df, stats, summary_text, recommendations_text, logo_path
     buffer.seek(0)
     return buffer
 
-# ---------------------------- دوال واجهة الترخيص المحسّنة ----------------------------
+# ---------------------------- دوال واجهة الترخيص ----------------------------
 def render_license_status(data):
-    """عرض حالة الترخيص الحالية للعميل في الشريط الجانبي."""
     st.sidebar.header("🔑 حالة الترخيص")
     status = data.get("license_status", "trial")
     usage = data.get("usage_count", 0)
@@ -825,7 +818,6 @@ def render_license_status(data):
         st.sidebar.error("⛔ حالة الترخيص غير صالحة")
 
 def render_license_activation():
-    """نموذج إدخال مفتاح الترخيص داخل expander في الشريط الجانبي."""
     with st.sidebar.expander("🔓 تفعيل الترخيص"):
         key_input = st.text_input("أدخل مفتاح الترخيص", type="password")
         if st.button("تفعيل"):
@@ -837,7 +829,6 @@ def render_license_activation():
                 st.error(msg)
 
 def get_trial_notifications(data):
-    """توليد رسائل تنبيه قبل انتهاء النسخة التجريبية."""
     usage = data.get("usage_count", 0)
     limit = data.get("trial_limit", 10)
     first_use_str = data.get("first_use")
@@ -862,7 +853,6 @@ def get_trial_notifications(data):
     return messages
 
 def render_trial_notifications():
-    """عرض التنبيهات في الشريط الجانبي إذا كان المستخدم في الوضع التجريبي."""
     data = load_client_data_encrypted()
     if data.get("license_status") == "trial":
         notifications = get_trial_notifications(data)
@@ -875,27 +865,21 @@ def main():
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    # ---------------------------- التحقق من الترخيص الآمن مع الحد الزمني ----------------------------
     data = load_client_data_encrypted()
     is_allowed, message = check_license_secure_with_trial()
 
     if not is_allowed:
         st.error(f"⛔ {message}")
-        render_license_activation()  # عرض نموذج التفعيل
+        render_license_activation()
         st.stop()
     else:
         st.info(message)
-        # زيادة عدد الاستخدامات فقط إذا كانت الحالة trial
         if data.get("license_status") == "trial":
             increment_usage()
 
-    # عرض حالة الترخيص بشكل دائم في الشريط الجانبي
     render_license_status(load_client_data_encrypted())
-
-    # عرض التنبيهات قبل انتهاء النسخة التجريبية
     render_trial_notifications()
 
-    # ---------------------------- باقي التهيئة ----------------------------
     if 'api_key_encrypted' not in st.session_state:
         st.session_state['api_key_encrypted'] = None
     if 'logo_path' not in st.session_state:

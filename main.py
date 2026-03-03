@@ -3,7 +3,6 @@ AdInsight AI - AI Smart Report Generator for Freelancers & Agencies
 الإصدار 2.0 - مع تكامل OpenAI API
 """
 
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -30,6 +29,11 @@ from cryptography.fernet import Fernet
 
 # ---------------------------- تحميل متغيرات البيئة ----------------------------
 load_dotenv()
+
+# ---------------------------- Feature Flag للتطوير ----------------------------
+# إذا لم يتم تعيين DEV_MODE، نفترض أنه 1 (وضع التطوير) لتسهيل العمل المحلي
+# في الإنتاج، يجب ضبط DEV_MODE=0
+DEV_MODE = os.getenv("DEV_MODE", "1") == "1"
 
 # ---------------------------- إعداد مفتاح التشفير من st.secrets ----------------------------
 def get_fernet():
@@ -277,7 +281,13 @@ def verify_license_signature() -> bool:
     return hmac.compare_digest(sig, expected_sig)
 
 def check_license_secure_with_trial():
-    """التحقق من الترخيص مع حماية التزوير ومدة النسخة التجريبية وربط الجهاز."""
+    """
+    التحقق من الترخيص مع حماية التزوير ومدة النسخة التجريبية وربط الجهاز.
+    إذا كان DEV_MODE مفعلاً، يتم تجاوز كل التحقق.
+    """
+    if DEV_MODE:
+        return True, "⚠️ وضع التطوير: تم تجاوز التحقق من الترخيص."
+
     try:
         data = load_client_data_encrypted()
     except (FileNotFoundError, ValueError) as e:
@@ -1014,13 +1024,7 @@ def main():
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    try:
-        data = load_client_data_encrypted()
-    except (FileNotFoundError, ValueError) as e:
-        st.error(str(e))
-        render_license_activation()
-        st.stop()
-
+    # التحقق من الترخيص (مع مراعاة DEV_MODE)
     is_allowed, message = check_license_secure_with_trial()
 
     if not is_allowed:
@@ -1028,9 +1032,23 @@ def main():
         render_license_activation()
         st.stop()
     else:
-        st.info(message)
+        if DEV_MODE:
+            st.info("🚧 وضع التطوير: الترخيص غير مفعل.")
+        else:
+            st.info(message)
+            # زيادة عدد الاستخدامات فقط إذا كان الوضع تجريبياً وليس تطويراً
+            if load_client_data_encrypted().get("license_status") == "trial":
+                # is_trial_valid ستزيد الاستخدامات تلقائياً، لذلك لا نحتاج لاستدعاء منفصل
+                pass
 
-    render_license_status(load_client_data_encrypted())
+    # عرض حالة الترخيص (حتى في وضع التطوير نعرض رسالة خاصة)
+    try:
+        data = load_client_data_encrypted()
+        render_license_status(data)
+    except:
+        # في وضع التطوير قد لا يوجد ملف، نعرض رسالة بسيطة
+        if DEV_MODE:
+            st.sidebar.info("🔓 وضع التطوير: الترخيش غير مفعل.")
     render_trial_notifications()
 
     if 'api_key_encrypted' not in st.session_state:

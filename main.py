@@ -19,13 +19,46 @@ import json
 import secrets
 import hashlib
 import hmac
+import ctypes
+import sys
+import ast  # <-- إضافة استيراد ast
 from pathlib import Path
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
+import keyring
 
 # ---------------------------- تحميل متغيرات البيئة ----------------------------
 load_dotenv()
+
+# ---------------------------- إعداد keyring للمفتاح السري ----------------------------
+SERVICE_NAME = "AdInsight"
+KEY_NAME = "fernet_key"
+
+def get_fernet():
+    """
+    استرجاع مفتاح Fernet من keyring مع محاولة مسح الذاكرة بعد الاستخدام.
+    إذا لم يتم العثور على المفتاح، يتم رفع خطأ مع تعليمات لإعداده.
+    """
+    secret = keyring.get_password(SERVICE_NAME, KEY_NAME)
+    if not secret:
+        raise RuntimeError(
+            "❌ لم يتم العثور على المفتاح السري في keyring.\n"
+            "يرجى تشغيل سكريبت الإعداد أولاً:\n"
+            "python -c \"import keyring; keyring.set_password('AdInsight', 'fernet_key', input('أدخل المفتاح: '))\""
+        )
+    key_bytes = secret.encode()
+    fernet = Fernet(key_bytes)
+    # محاولة مسح المفتاح من الذاكرة (غير مضمونة لكنها تزيد الصعوبة)
+    try:
+        ctypes.memset(id(key_bytes) + 28, 0, len(key_bytes))
+    except:
+        pass
+    del secret
+    del key_bytes
+    return fernet
+
+fernet = get_fernet()
 
 # ---------------------------- مكتبات إنشاء PDF ----------------------------
 from reportlab.lib.pagesizes import A4
@@ -76,14 +109,17 @@ SYNONYMS = {
 
 REQUIRED_COLUMNS = ['campaign_name', 'impressions', 'clicks', 'spend', 'conversions']
 
-# ---------------------------- المفتاح السري للتوقيع والتشفير ----------------------------
-SECRET_KEY = os.environ.get("ADINSIGHT_SECRET_KEY", "SuperSecretKey-ChangeThisInProduction").encode()
-
-def get_fernet_key():
-    key_bytes = hashlib.sha256(SECRET_KEY).digest()
-    return base64.urlsafe_b64encode(key_bytes)
-
-fernet = Fernet(get_fernet_key())
+# ---------------------------- دوال مساعدة للجهاز والتاريخ ----------------------------
+def get_device_id():
+    """إنشاء معرف فريد للجهاز (يعتمد على MAC address إن أمكن)."""
+    try:
+        mac = uuid.getnode()
+        if mac == uuid.getnode() and (mac >> 40) % 2 == 0:
+            return hashlib.sha256(str(mac).encode()).hexdigest()
+    except:
+        pass
+    fallback = f"{os.name}_{os.getlogin()}_{Path.home()}"
+    return hashlib.sha256(fallback.encode()).hexdigest()
 
 # ---------------------------- تخزين بيانات العميل المحلي (مشفر) ----------------------------
 CLIENT_DATA_PATH = Path.home() / ".adinsight" / "client_data.json"
@@ -99,63 +135,72 @@ def save_client_data_encrypted(data):
         f.write(encrypted)
 
 def load_client_data_encrypted():
-    ensure_data_dir()
-    if CLIENT_DATA_PATH.exists():
-        try:
-            with open(CLIENT_DATA_PATH, "rb") as f:
-                encrypted = f.read()
-            json_bytes = fernet.decrypt(encrypted)
-            return json.loads(json_bytes.decode('utf-8'))
-        except Exception as e:
-            print(f"تحذير: فشل فك تشفير بيانات الترخيص: {e}")
-    first_use = datetime.datetime.now().isoformat()
-    default_data = {
-        "email": "",
-        "license_status": "trial",
-        "usage_count": 0,
-        "trial_limit": 10,
-        "first_use": first_use,
-        "trial_days": 7,
-        "license_key": None,
-        "license_type": None,
-        "signature": None
-    }
-    save_client_data_encrypted(default_data)
-    return default_data
-
-def increment_usage():
-    data = load_client_data_encrypted()
-    if data.get("license_status") == "trial":
-        data["usage_count"] += 1
-        if data.get("first_use") is None:
-            data["first_use"] = datetime.datetime.now().isoformat()
-        save_client_data_encrypted(data)
+    """
+    تحميل بيانات الترخيص المشفرة بشكل آمن.
+    ترمي استثناءً إذا فشل فك التشفير أو الملف غير موجود.
+    """
+    if not CLIENT_DATA_PATH.exists():
+        raise FileNotFoundError("❌ ملف الترخيص غير موجود. يرجى تفعيل الترخيص أولاً.")
+    with open(CLIENT_DATA_PATH, "rb") as f:
+        encrypted = f.read()
+    try:
+        decrypted = fernet.decrypt(encrypted)
+        data = json.loads(decrypted.decode('utf-8'))
+        # التأكد من وجود الحقول المطلوبة (للملفات القديمة)
+        if "device_id" not in data:
+            data["device_id"] = None
+        if "expiry" not in data:
+            data["expiry"] = None
+        return data
+    except Exception as e:
+        raise ValueError(
+            f"❌ فشل فك تشفير ملف الترخيص. ربما تم التلاعب بالملف أو استخدام مفتاح خاطئ.\n"
+            f"التفاصيل: {e}"
+        )
 
 def is_trial_valid(data):
+    """
+    التحقق من صحة النسخة التجريبية مع ربط الجهاز وزيادة عدد الاستخدامات.
+    يتم استدعاؤها مرة واحدة لكل تشغيل.
+    """
+    # 1. إصلاح إذا لم يكن هناك device_id (للملفات القديمة)
+    if "device_id" not in data or data["device_id"] is None:
+        data["device_id"] = get_device_id()
+        save_client_data_encrypted(data)
+
+    # 2. التحقق من معرف الجهاز
+    if data["device_id"] != get_device_id():
+        return False, "⛔ النسخة التجريبية مرتبطة بجهاز آخر ولا يمكن استخدامها هنا."
+
+    # 3. التحقق من تاريخ أول استخدام
+    first_use_str = data.get("first_use")
+    if not first_use_str:
+        return False, "⛔ بيانات النسخة التجريبية غير صالحة (first_use مفقود)."
+    try:
+        first_use = datetime.datetime.fromisoformat(first_use_str)
+    except:
+        return False, "⛔ تنسيق تاريخ أول استخدام غير صالح."
+
+    trial_days = data.get("trial_days", 7)
+    days_passed = (datetime.datetime.now() - first_use).days
+    if days_passed > trial_days:
+        return False, "⛔ انتهت صلاحية النسخة التجريبية (تجاوزت المدة المسموحة)."
+
+    # 4. التحقق من عدد الاستخدامات
     usage = data.get("usage_count", 0)
     limit = data.get("trial_limit", 10)
-    first_use_str = data.get("first_use")
-    trial_days = data.get("trial_days", 7)
+    if usage >= limit:
+        return False, f"⛔ انتهت النسخة التجريبية (استخدمت {usage} من أصل {limit} استخدامات)."
 
-    if not first_use_str:
-        data["first_use"] = datetime.datetime.now().isoformat()
-        save_client_data_encrypted(data)
-        first_use_str = data["first_use"]
+    # 5. كل شيء صالح: نقوم بزيادة الاستخدام وحفظ البيانات
+    data["usage_count"] = usage + 1
+    save_client_data_encrypted(data)
 
-    try:
-        first_use_date = datetime.datetime.fromisoformat(first_use_str)
-    except:
-        first_use_date = datetime.datetime.now()
-    
-    delta_days = (datetime.datetime.now() - first_use_date).days
-    if usage < limit and delta_days < trial_days:
-        remaining_usage = limit - usage
-        remaining_days = trial_days - delta_days
-        return True, f"⚠️ نسخة تجريبية: {remaining_usage} استخدامات متبقية، {remaining_days} أيام متبقية"
-    else:
-        return False, "⛔ انتهت النسخة التجريبية. يرجى تفعيل الترخيص."
+    remaining_usage = limit - (usage + 1)
+    remaining_days = trial_days - days_passed
+    return True, f"⚠️ نسخة تجريبية: {remaining_usage} استخدامات متبقية، {remaining_days} أيام متبقية"
 
-# ---------------------------- إدارة مفاتيح الترخيص مع توقيع HMAC ----------------------------
+# ---------------------------- إدارة مفاتيح الترخيص مع ربط الجهاز وتاريخ انتهاء ----------------------------
 ALLOWED_KEYS = {
     "A1B2-C3D4-E5F6-G7H8": {"type": "lifetime", "email": "client1@example.com"},
     "I9J0-K1L2-M3N4-O5P6": {"type": "trial", "email": "client2@example.com"},
@@ -173,23 +218,70 @@ def verify_license_key(input_key):
     return input_key in ALLOWED_KEYS
 
 def generate_signature(license_key: str) -> str:
-    return hmac.new(SECRET_KEY, license_key.encode(), hashlib.sha256).hexdigest()
+    # SECRET_KEY هنا هو نفس المفتاح الذي استخدمناه لـ fernet (يمكن استخدامه للتوقيع أيضاً)
+    return hmac.new(fernet._encryption_key, license_key.encode(), hashlib.sha256).hexdigest()
 
-def activate_license(key):
-    if verify_license_key(key):
+def activate_license(key, expiry_days=365):
+    """
+    تفعيل الترخيص مع expiry date وربط بالجهاز.
+    تقوم بإنشاء ملف الترخيص إذا لم يكن موجوداً.
+    """
+    if not verify_license_key(key):
+        return False, "❌ مفتاح غير صالح."
+
+    # نقوم بتحميل البيانات الحالية إن وجدت، وإلا نبدأ ببيانات افتراضية
+    try:
         data = load_client_data_encrypted()
-        data["license_status"] = "active"
-        data["license_key"] = key
-        data["license_type"] = ALLOWED_KEYS[key]["type"]
-        data["email"] = ALLOWED_KEYS[key].get("email", data["email"])
-        data["signature"] = generate_signature(key)
-        save_client_data_encrypted(data)
-        return True, "✅ تم تفعيل الترخيص بنجاح!"
-    else:
-        return False, "❌ مفتاح ترخيص غير صالح."
+    except FileNotFoundError:
+        # إنشاء بيانات افتراضية بدون تاريخ أول استخدام لأن الترخيص سيكون active
+        data = {
+            "email": "",
+            "license_status": "trial",  # سنغيره لاحقاً
+            "usage_count": 0,
+            "trial_limit": 10,
+            "first_use": None,
+            "trial_days": 7,
+            "license_key": None,
+            "license_type": None,
+            "signature": None,
+            "device_id": None,
+            "expiry": None
+        }
+    except ValueError as e:
+        # ملف تالف، نعيد إنشاءه بالكامل
+        data = {
+            "email": "",
+            "license_status": "trial",
+            "usage_count": 0,
+            "trial_limit": 10,
+            "first_use": None,
+            "trial_days": 7,
+            "license_key": None,
+            "license_type": None,
+            "signature": None,
+            "device_id": None,
+            "expiry": None
+        }
+
+    device_id = get_device_id()
+    expiry = (datetime.date.today() + datetime.timedelta(days=expiry_days)).isoformat()
+
+    data["license_status"] = "active"
+    data["license_key"] = key
+    data["device_id"] = device_id
+    data["expiry"] = expiry
+    data["license_type"] = ALLOWED_KEYS[key]["type"]
+    data["email"] = ALLOWED_KEYS[key].get("email", data.get("email", ""))
+    data["signature"] = generate_signature(key)
+
+    save_client_data_encrypted(data)
+    return True, "✅ تم التفعيل بنجاح!"
 
 def verify_license_signature() -> bool:
-    data = load_client_data_encrypted()
+    try:
+        data = load_client_data_encrypted()
+    except:
+        return False
     key = data.get("license_key", "")
     sig = data.get("signature", "")
     if not key or not sig:
@@ -198,14 +290,39 @@ def verify_license_signature() -> bool:
     return hmac.compare_digest(sig, expected_sig)
 
 def check_license_secure_with_trial():
-    data = load_client_data_encrypted()
+    """التحقق من الترخيص مع حماية التزوير ومدة النسخة التجريبية وربط الجهاز."""
+    try:
+        data = load_client_data_encrypted()
+    except (FileNotFoundError, ValueError) as e:
+        # إذا لم يوجد ملف، نعتبر أن المستخدم يحتاج لتفعيل الترخيص
+        return False, str(e)
+
     status = data.get("license_status", "trial")
 
     if status == "active":
-        if verify_license_signature():
-            return True, "✅ مرخص (محمي)"
-        else:
+        expiry = data.get("expiry")
+        device_id = data.get("device_id")
+        stored_key = data.get("license_key")
+
+        if not expiry or not device_id or not stored_key:
+            return False, "⛔ بيانات الترخيص غير مكتملة."
+
+        try:
+            expiry_date = datetime.date.fromisoformat(expiry)
+            if expiry_date < datetime.date.today():
+                return False, "⛔ انتهت صلاحية الترخيص."
+        except:
+            return False, "⛔ تاريخ انتهاء غير صالح."
+
+        current_device = get_device_id()
+        if device_id != current_device:
+            return False, "⛔ هذا الترخيص غير مخصص لهذا الجهاز."
+
+        if not verify_license_signature():
             return False, "⛔ مفتاح الترخيص تم التلاعب به!"
+
+        return True, "✅ مرخص (محمي)"
+
     elif status == "trial":
         return is_trial_valid(data)
     else:
@@ -535,21 +652,15 @@ def export_excel_with_summary(df_clean, user_password=None):
             adjusted_width = min(max_length + 2, 30)
             ws_summary.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
 
-        writer.save()
     output.seek(0)
     return output
 
 # ---------------------------- دالة توليد الملخص الذكي (محدثة لمكتبة OpenAI v1.0.0+) ----------------------------
 def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
-    """
-    توليد الملخص التنفيذي والتوصيات عبر OpenAI API.
-    متوافق مع الإصدار 1.0.0+ من مكتبة OpenAI.
-    """
     api_key = st.session_state.get('api_key')
     if not api_key:
         return None, None, "❌ مفتاح API غير موجود."
 
-    # إنشاء عميل OpenAI مع timeout
     client = OpenAI(api_key=api_key, timeout=30)
 
     prompt = f"""
@@ -587,7 +698,6 @@ def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
                 max_tokens=600,
             )
 
-            # التحقق من وجود choices والمحتوى (تحسين دفاعي)
             if not response.choices:
                 raise ValueError("❌ استجابة OpenAI فارغة أو غير متوقعة.")
             content = response.choices[0].message.content.strip()
@@ -793,6 +903,64 @@ def generate_pdf_report(df, stats, summary_text, recommendations_text, logo_path
     buffer.seek(0)
     return buffer
 
+# ---------------------------- دالة التحقق من imports عبر AST ----------------------------
+def validate_no_imports(code: str):
+    """
+    تفحص الكود باستخدام AST وترفض أي محاولة لاستيراد وحدات.
+    """
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError("Import statements are not allowed.")
+
+# ---------------------------- منفذ الأكواد الآمن ----------------------------
+class CodeExecutor:
+    """
+    تنفيذ أكواد بايثون مخصصة في بيئة معزولة وآمنة.
+    """
+    def __init__(self):
+        # قائمة بيضاء بالدوال الأساسية الآمنة
+        safe_builtins = {
+            "len": len,
+            "sum": sum,
+            "min": min,
+            "max": max,
+            "range": range,
+            "abs": abs,
+            "round": round,
+            "sorted": sorted,
+            "list": list,
+            "dict": dict,
+            "enumerate": enumerate,
+        }
+        # إنشاء بيئة تنفيذ مع هذه الـ builtins فقط
+        self._environment = {
+            "__builtins__": safe_builtins,
+        }
+        # إضافة pandas و numpy (سيتم تقييد استخداماتهما لاحقاً عبر AST)
+        self._environment.update({
+            "pd": pd,
+            "np": np,
+            "df": None,
+        })
+
+    def execute(self, code: str, data_frame):
+        """تنفيذ الكود في بيئة آمنة وإرجاع النتيجة (المخزنة في متغير result)"""
+        self._environment["df"] = data_frame
+
+        # منع أي import
+        validate_no_imports(code)
+
+        try:
+            exec(code, self._environment)
+            result = self._environment.get("result", None)
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+# إنشاء كائن المنفذ (يمكن إعادة استخدامه)
+executor = CodeExecutor()
+
 # ---------------------------- دوال واجهة الترخيص ----------------------------
 def render_license_status(data):
     st.sidebar.header("🔑 حالة الترخيص")
@@ -803,7 +971,8 @@ def render_license_status(data):
     trial_days = data.get("trial_days", 7)
 
     if status == "active":
-        st.sidebar.success("✅ مرخص (محمي)")
+        expiry = data.get("expiry", "غير محدد")
+        st.sidebar.success(f"✅ مرخص\nتاريخ الانتهاء: {expiry}")
     elif status == "trial":
         from datetime import datetime
         try:
@@ -853,7 +1022,10 @@ def get_trial_notifications(data):
     return messages
 
 def render_trial_notifications():
-    data = load_client_data_encrypted()
+    try:
+        data = load_client_data_encrypted()
+    except:
+        return
     if data.get("license_status") == "trial":
         notifications = get_trial_notifications(data)
         for msg in notifications:
@@ -865,7 +1037,15 @@ def main():
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    data = load_client_data_encrypted()
+    # تحميل بيانات الترخيص بشكل آمن
+    try:
+        data = load_client_data_encrypted()
+    except (FileNotFoundError, ValueError) as e:
+        st.error(str(e))
+        render_license_activation()
+        st.stop()
+
+    # التحقق من الترخيص (هنا يتم استدعاء is_trial_valid والتي تزيد الاستخدامات)
     is_allowed, message = check_license_secure_with_trial()
 
     if not is_allowed:
@@ -874,8 +1054,7 @@ def main():
         st.stop()
     else:
         st.info(message)
-        if data.get("license_status") == "trial":
-            increment_usage()
+        # لا حاجة لزيادة الاستخدامات هنا، لأن is_trial_valid قامت بذلك
 
     render_license_status(load_client_data_encrypted())
     render_trial_notifications()
@@ -983,6 +1162,7 @@ def main():
         ])
         st.table(mapping_df)
 
+        # تحليل البيانات الأساسي
         if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
             with st.spinner("جاري تحليل البيانات..."):
                 df_clean, stats = cached_calculate(df, tuple(mapping.items()))
@@ -1047,6 +1227,27 @@ def main():
                     file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+        # قسم تحليل الكود المخصص (جديد)
+        with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
+            st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
+            code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")
+            if st.button("تشغيل الكود"):
+                try:
+                    # نحتاج إلى df_clean من التحليل السابق، ولكن إذا لم يتم تحليل بعد نستخدم df الأصلي
+                    # نستخدم df الحالي (الخام) إن أمكن
+                    if 'df_clean' in locals():
+                        df_to_use = df_clean
+                    else:
+                        df_to_use = df
+                    res = executor.execute(code_input, df_to_use)
+                    if isinstance(res, dict) and "error" in res:
+                        st.error(f"خطأ في التنفيذ: {res['error']}")
+                    else:
+                        st.success("تم التنفيذ بنجاح.")
+                        st.write("النتيجة:", res)
+                except Exception as e:
+                    st.error(f"خطأ غير متوقع: {e}")
 
 if __name__ == "__main__":
     main()

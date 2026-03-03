@@ -21,42 +21,31 @@ import hashlib
 import hmac
 import ctypes
 import sys
-import ast  # <-- إضافة استيراد ast
+import ast
 from pathlib import Path
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
-import keyring
 
 # ---------------------------- تحميل متغيرات البيئة ----------------------------
 load_dotenv()
 
-# ---------------------------- إعداد keyring للمفتاح السري ----------------------------
-SERVICE_NAME = "AdInsight"
-KEY_NAME = "fernet_key"
-
+# ---------------------------- إعداد مفتاح التشفير من st.secrets ----------------------------
 def get_fernet():
     """
-    استرجاع مفتاح Fernet من keyring مع محاولة مسح الذاكرة بعد الاستخدام.
-    إذا لم يتم العثور على المفتاح، يتم رفع خطأ مع تعليمات لإعداده.
+    استرجاع مفتاح Fernet من st.secrets.
+    يجب تعريف FERNET_SECRET في secrets (مفتاح Base64 صالح).
     """
-    secret = keyring.get_password(SERVICE_NAME, KEY_NAME)
-    if not secret:
-        raise RuntimeError(
-            "❌ لم يتم العثور على المفتاح السري في keyring.\n"
-            "يرجى تشغيل سكريبت الإعداد أولاً:\n"
-            "python -c \"import keyring; keyring.set_password('AdInsight', 'fernet_key', input('أدخل المفتاح: '))\""
-        )
-    key_bytes = secret.encode()
-    fernet = Fernet(key_bytes)
-    # محاولة مسح المفتاح من الذاكرة (غير مضمونة لكنها تزيد الصعوبة)
     try:
-        ctypes.memset(id(key_bytes) + 28, 0, len(key_bytes))
-    except:
-        pass
-    del secret
-    del key_bytes
-    return fernet
+        secret = st.secrets["FERNET_SECRET"]
+    except KeyError:
+        raise RuntimeError(
+            "❌ لم يتم العثور على FERNET_SECRET في secrets.\n"
+            "أضف المفتاح في لوحة تحكم Streamlit (App settings -> Secrets) على شكل:\n"
+            "FERNET_SECRET = 'your_base64_key_here'\n"
+            "يمكنك توليد مفتاح باستخدام: from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+        )
+    return Fernet(secret.encode())
 
 fernet = get_fernet()
 
@@ -218,7 +207,7 @@ def verify_license_key(input_key):
     return input_key in ALLOWED_KEYS
 
 def generate_signature(license_key: str) -> str:
-    # SECRET_KEY هنا هو نفس المفتاح الذي استخدمناه لـ fernet (يمكن استخدامه للتوقيع أيضاً)
+    # استخدام مفتاح fernet للتوقيع
     return hmac.new(fernet._encryption_key, license_key.encode(), hashlib.sha256).hexdigest()
 
 def activate_license(key, expiry_days=365):
@@ -229,14 +218,12 @@ def activate_license(key, expiry_days=365):
     if not verify_license_key(key):
         return False, "❌ مفتاح غير صالح."
 
-    # نقوم بتحميل البيانات الحالية إن وجدت، وإلا نبدأ ببيانات افتراضية
     try:
         data = load_client_data_encrypted()
     except FileNotFoundError:
-        # إنشاء بيانات افتراضية بدون تاريخ أول استخدام لأن الترخيص سيكون active
         data = {
             "email": "",
-            "license_status": "trial",  # سنغيره لاحقاً
+            "license_status": "trial",
             "usage_count": 0,
             "trial_limit": 10,
             "first_use": None,
@@ -248,7 +235,6 @@ def activate_license(key, expiry_days=365):
             "expiry": None
         }
     except ValueError as e:
-        # ملف تالف، نعيد إنشاءه بالكامل
         data = {
             "email": "",
             "license_status": "trial",
@@ -294,7 +280,6 @@ def check_license_secure_with_trial():
     try:
         data = load_client_data_encrypted()
     except (FileNotFoundError, ValueError) as e:
-        # إذا لم يوجد ملف، نعتبر أن المستخدم يحتاج لتفعيل الترخيص
         return False, str(e)
 
     status = data.get("license_status", "trial")
@@ -655,7 +640,7 @@ def export_excel_with_summary(df_clean, user_password=None):
     output.seek(0)
     return output
 
-# ---------------------------- دالة توليد الملخص الذكي (محدثة لمكتبة OpenAI v1.0.0+) ----------------------------
+# ---------------------------- دالة توليد الملخص الذكي ----------------------------
 def generate_ai_summary_safe(stats, model="gpt-3.5-turbo", max_retries=3):
     api_key = st.session_state.get('api_key')
     if not api_key:
@@ -905,9 +890,6 @@ def generate_pdf_report(df, stats, summary_text, recommendations_text, logo_path
 
 # ---------------------------- دالة التحقق من imports عبر AST ----------------------------
 def validate_no_imports(code: str):
-    """
-    تفحص الكود باستخدام AST وترفض أي محاولة لاستيراد وحدات.
-    """
     tree = ast.parse(code)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -915,11 +897,7 @@ def validate_no_imports(code: str):
 
 # ---------------------------- منفذ الأكواد الآمن ----------------------------
 class CodeExecutor:
-    """
-    تنفيذ أكواد بايثون مخصصة في بيئة معزولة وآمنة.
-    """
     def __init__(self):
-        # قائمة بيضاء بالدوال الأساسية الآمنة
         safe_builtins = {
             "len": len,
             "sum": sum,
@@ -933,11 +911,9 @@ class CodeExecutor:
             "dict": dict,
             "enumerate": enumerate,
         }
-        # إنشاء بيئة تنفيذ مع هذه الـ builtins فقط
         self._environment = {
             "__builtins__": safe_builtins,
         }
-        # إضافة pandas و numpy (سيتم تقييد استخداماتهما لاحقاً عبر AST)
         self._environment.update({
             "pd": pd,
             "np": np,
@@ -945,20 +921,20 @@ class CodeExecutor:
         })
 
     def execute(self, code: str, data_frame):
-        """تنفيذ الكود في بيئة آمنة وإرجاع النتيجة (المخزنة في متغير result)"""
         self._environment["df"] = data_frame
 
-        # منع أي import
-        validate_no_imports(code)
+        try:
+            validate_no_imports(code)
+        except Exception as e:
+            return {"error": f"Validation error: {str(e)}"}
 
         try:
             exec(code, self._environment)
             result = self._environment.get("result", None)
             return result
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": f"Execution error: {str(e)}"}
 
-# إنشاء كائن المنفذ (يمكن إعادة استخدامه)
 executor = CodeExecutor()
 
 # ---------------------------- دوال واجهة الترخيص ----------------------------
@@ -1037,7 +1013,6 @@ def main():
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    # تحميل بيانات الترخيص بشكل آمن
     try:
         data = load_client_data_encrypted()
     except (FileNotFoundError, ValueError) as e:
@@ -1045,7 +1020,6 @@ def main():
         render_license_activation()
         st.stop()
 
-    # التحقق من الترخيص (هنا يتم استدعاء is_trial_valid والتي تزيد الاستخدامات)
     is_allowed, message = check_license_secure_with_trial()
 
     if not is_allowed:
@@ -1054,7 +1028,6 @@ def main():
         st.stop()
     else:
         st.info(message)
-        # لا حاجة لزيادة الاستخدامات هنا، لأن is_trial_valid قامت بذلك
 
     render_license_status(load_client_data_encrypted())
     render_trial_notifications()
@@ -1162,7 +1135,6 @@ def main():
         ])
         st.table(mapping_df)
 
-        # تحليل البيانات الأساسي
         if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
             with st.spinner("جاري تحليل البيانات..."):
                 df_clean, stats = cached_calculate(df, tuple(mapping.items()))
@@ -1228,21 +1200,18 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-        # قسم تحليل الكود المخصص (جديد)
         with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
             st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
             code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")
             if st.button("تشغيل الكود"):
                 try:
-                    # نحتاج إلى df_clean من التحليل السابق، ولكن إذا لم يتم تحليل بعد نستخدم df الأصلي
-                    # نستخدم df الحالي (الخام) إن أمكن
                     if 'df_clean' in locals():
                         df_to_use = df_clean
                     else:
                         df_to_use = df
                     res = executor.execute(code_input, df_to_use)
                     if isinstance(res, dict) and "error" in res:
-                        st.error(f"خطأ في التنفيذ: {res['error']}")
+                        st.error(f"خطأ: {res['error']}")
                     else:
                         st.success("تم التنفيذ بنجاح.")
                         st.write("النتيجة:", res)

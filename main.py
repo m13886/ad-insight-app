@@ -31,16 +31,10 @@ from cryptography.fernet import Fernet
 load_dotenv()
 
 # ---------------------------- Feature Flag للتطوير ----------------------------
-# إذا لم يتم تعيين DEV_MODE، نفترض أنه 1 (وضع التطوير) لتسهيل العمل المحلي
-# في الإنتاج، يجب ضبط DEV_MODE=0
 DEV_MODE = os.getenv("DEV_MODE", "1") == "1"
 
 # ---------------------------- إعداد مفتاح التشفير من st.secrets ----------------------------
 def get_fernet():
-    """
-    استرجاع مفتاح Fernet من st.secrets.
-    يجب تعريف FERNET_SECRET في secrets (مفتاح Base64 صالح).
-    """
     try:
         secret = st.secrets["FERNET_SECRET"]
     except KeyError:
@@ -105,7 +99,6 @@ REQUIRED_COLUMNS = ['campaign_name', 'impressions', 'clicks', 'spend', 'conversi
 
 # ---------------------------- دوال مساعدة للجهاز والتاريخ ----------------------------
 def get_device_id():
-    """إنشاء معرف فريد للجهاز (يعتمد على MAC address إن أمكن)."""
     try:
         mac = uuid.getnode()
         if mac == uuid.getnode() and (mac >> 40) % 2 == 0:
@@ -129,10 +122,6 @@ def save_client_data_encrypted(data):
         f.write(encrypted)
 
 def load_client_data_encrypted():
-    """
-    تحميل بيانات الترخيص المشفرة بشكل آمن.
-    ترمي استثناءً إذا فشل فك التشفير أو الملف غير موجود.
-    """
     if not CLIENT_DATA_PATH.exists():
         raise FileNotFoundError("❌ ملف الترخيص غير موجود. يرجى تفعيل الترخيص أولاً.")
     with open(CLIENT_DATA_PATH, "rb") as f:
@@ -140,7 +129,6 @@ def load_client_data_encrypted():
     try:
         decrypted = fernet.decrypt(encrypted)
         data = json.loads(decrypted.decode('utf-8'))
-        # التأكد من وجود الحقول المطلوبة (للملفات القديمة)
         if "device_id" not in data:
             data["device_id"] = None
         if "expiry" not in data:
@@ -153,20 +141,13 @@ def load_client_data_encrypted():
         )
 
 def is_trial_valid(data):
-    """
-    التحقق من صحة النسخة التجريبية مع ربط الجهاز وزيادة عدد الاستخدامات.
-    يتم استدعاؤها مرة واحدة لكل تشغيل.
-    """
-    # 1. إصلاح إذا لم يكن هناك device_id (للملفات القديمة)
     if "device_id" not in data or data["device_id"] is None:
         data["device_id"] = get_device_id()
         save_client_data_encrypted(data)
 
-    # 2. التحقق من معرف الجهاز
     if data["device_id"] != get_device_id():
         return False, "⛔ النسخة التجريبية مرتبطة بجهاز آخر ولا يمكن استخدامها هنا."
 
-    # 3. التحقق من تاريخ أول استخدام
     first_use_str = data.get("first_use")
     if not first_use_str:
         return False, "⛔ بيانات النسخة التجريبية غير صالحة (first_use مفقود)."
@@ -180,13 +161,11 @@ def is_trial_valid(data):
     if days_passed > trial_days:
         return False, "⛔ انتهت صلاحية النسخة التجريبية (تجاوزت المدة المسموحة)."
 
-    # 4. التحقق من عدد الاستخدامات
     usage = data.get("usage_count", 0)
     limit = data.get("trial_limit", 10)
     if usage >= limit:
         return False, f"⛔ انتهت النسخة التجريبية (استخدمت {usage} من أصل {limit} استخدامات)."
 
-    # 5. كل شيء صالح: نقوم بزيادة الاستخدام وحفظ البيانات
     data["usage_count"] = usage + 1
     save_client_data_encrypted(data)
 
@@ -194,7 +173,7 @@ def is_trial_valid(data):
     remaining_days = trial_days - days_passed
     return True, f"⚠️ نسخة تجريبية: {remaining_usage} استخدامات متبقية، {remaining_days} أيام متبقية"
 
-# ---------------------------- إدارة مفاتيح الترخيص مع ربط الجهاز وتاريخ انتهاء ----------------------------
+# ---------------------------- إدارة مفاتيح الترخيص ----------------------------
 ALLOWED_KEYS = {
     "A1B2-C3D4-E5F6-G7H8": {"type": "lifetime", "email": "client1@example.com"},
     "I9J0-K1L2-M3N4-O5P6": {"type": "trial", "email": "client2@example.com"},
@@ -212,14 +191,9 @@ def verify_license_key(input_key):
     return input_key in ALLOWED_KEYS
 
 def generate_signature(license_key: str) -> str:
-    # استخدام مفتاح fernet للتوقيع
     return hmac.new(fernet._encryption_key, license_key.encode(), hashlib.sha256).hexdigest()
 
 def activate_license(key, expiry_days=365):
-    """
-    تفعيل الترخيص مع expiry date وربط بالجهاز.
-    تقوم بإنشاء ملف الترخيص إذا لم يكن موجوداً.
-    """
     if not verify_license_key(key):
         return False, "❌ مفتاح غير صالح."
 
@@ -281,10 +255,6 @@ def verify_license_signature() -> bool:
     return hmac.compare_digest(sig, expected_sig)
 
 def check_license_secure_with_trial():
-    """
-    التحقق من الترخيص مع حماية التزوير ومدة النسخة التجريبية وربط الجهاز.
-    إذا كان DEV_MODE مفعلاً، يتم تجاوز كل التحقق.
-    """
     if DEV_MODE:
         return True, "⚠️ وضع التطوير: تم تجاوز التحقق من الترخيص."
 
@@ -1021,6 +991,15 @@ def render_trial_notifications():
 # ---------------------------- واجهة Streamlit ----------------------------
 def main():
     st.set_page_config(page_title="AdInsight AI", layout="wide")
+    
+    # تهيئة حالة الجلسة
+    if "uploaded_file_name" not in st.session_state:
+        st.session_state.uploaded_file_name = None
+    if "df" not in st.session_state:
+        st.session_state.df = None
+    if "mapping" not in st.session_state:
+        st.session_state.mapping = None
+
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
@@ -1037,16 +1016,13 @@ def main():
         else:
             st.info(message)
             # زيادة عدد الاستخدامات فقط إذا كان الوضع تجريبياً وليس تطويراً
-            if load_client_data_encrypted().get("license_status") == "trial":
-                # is_trial_valid ستزيد الاستخدامات تلقائياً، لذلك لا نحتاج لاستدعاء منفصل
-                pass
+            # is_trial_valid ستزيد الاستخدامات تلقائياً، لذلك لا نحتاج لاستدعاء منفصل
 
-    # عرض حالة الترخيص (حتى في وضع التطوير نعرض رسالة خاصة)
+    # عرض حالة الترخيص
     try:
         data = load_client_data_encrypted()
         render_license_status(data)
     except:
-        # في وضع التطوير قد لا يوجد ملف، نعرض رسالة بسيطة
         if DEV_MODE:
             st.sidebar.info("🔓 وضع التطوير: الترخيش غير مفعل.")
     render_trial_notifications()
@@ -1106,136 +1082,149 @@ def main():
         st.markdown("---")
         st.caption("AdInsight AI - جميع الحقوق محفوظة © 2026")
 
-    uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx'])
+    # رفع الملف
+    uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx', 'xls'])
 
     if uploaded_file is not None:
-        st.info(f"⚠️ سيتم معالجة أول {MAX_ROWS} صف فقط من الملف لضمان الأداء والأمان. إذا كان ملفك أكبر، يُرجى تقسيمه.")
-
-        try:
-            df, file_type = load_file_smart(uploaded_file, max_rows=MAX_ROWS)
-            st.success(f"✅ تم تحميل الملف بنجاح. نوع الملف: {file_type.upper()}")
-        except ValueError as e:
-            st.error(f"❌ فشل تحميل الملف: {e}")
-            st.stop()
-
-        st.subheader("🔍 عينة من البيانات المرفوعة")
-        st.dataframe(df.head())
-
-        mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
-        missing = validate_mapping(mapping, REQUIRED_COLUMNS)
-
-        if missing:
-            st.warning(f"⚠️ لم نتمكن من تحديد الأعمدة التالية تلقائياً: {', '.join(missing)}")
-            st.markdown("يرجى تحديد العمود المناسب لكل منها من القوائم أدناه.")
-            manual_mapping = {}
-            for std_col in missing:
-                options = ['-- لا يوجد --'] + list(df.columns)
-                selected = st.selectbox(
-                    label=f"**{STANDARD_COLUMNS[std_col]}**",
-                    options=options,
-                    help=f"ابحث عن عمود يحتوي على بيانات {STANDARD_COLUMNS[std_col]}، مثل: {', '.join(SYNONYMS[std_col][:3])} ...",
-                    key=f"manual_{std_col}"
-                )
-                if selected != '-- لا يوجد --':
-                    manual_mapping[std_col] = selected
-            for std, orig in manual_mapping.items():
-                mapping[std] = orig
-            missing_after = validate_mapping(mapping, REQUIRED_COLUMNS)
-            if missing_after:
-                st.error("❌ لا يزال هناك أعمدة إلزامية مفقودة. يرجى التحقق من التعيينات أعلاه.")
+        # إذا كان الملف مختلفاً عن المخزن، نقوم بتحميله
+        if uploaded_file.name != st.session_state.uploaded_file_name:
+            try:
+                df, file_type = load_file_smart(uploaded_file)
+                st.session_state.df = df
+                st.session_state.mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
+                st.session_state.uploaded_file_name = uploaded_file.name
+                st.success("✅ تم تحميل الملف بنجاح")
+            except Exception as e:
+                st.error(f"❌ فشل تحميل الملف: {e}")
                 st.stop()
+
+    # استعادة البيانات من الجلسة
+    df = st.session_state.df
+    mapping = st.session_state.mapping
+
+    # إذا لم توجد بيانات، نطلب رفع ملف
+    if df is None or mapping is None:
+        st.info("📁 يرجى رفع ملف للبدء.")
+        st.stop()
+
+    # بقية التطبيق (عرض عينة، تعيين الأعمدة المفقودة، التحليل، إلخ)
+    st.subheader("🔍 عينة من البيانات المرفوعة")
+    st.dataframe(df.head())
+
+    missing = validate_mapping(mapping, REQUIRED_COLUMNS)
+
+    if missing:
+        st.warning(f"⚠️ لم نتمكن من تحديد الأعمدة التالية تلقائياً: {', '.join(missing)}")
+        st.markdown("يرجى تحديد العمود المناسب لكل منها من القوائم أدناه.")
+        manual_mapping = {}
+        for std_col in missing:
+            options = ['-- لا يوجد --'] + list(df.columns)
+            selected = st.selectbox(
+                label=f"**{STANDARD_COLUMNS[std_col]}**",
+                options=options,
+                help=f"ابحث عن عمود يحتوي على بيانات {STANDARD_COLUMNS[std_col]}، مثل: {', '.join(SYNONYMS[std_col][:3])} ...",
+                key=f"manual_{std_col}"
+            )
+            if selected != '-- لا يوجد --':
+                manual_mapping[std_col] = selected
+        for std, orig in manual_mapping.items():
+            mapping[std] = orig
+        missing_after = validate_mapping(mapping, REQUIRED_COLUMNS)
+        if missing_after:
+            st.error("❌ لا يزال هناك أعمدة إلزامية مفقودة. يرجى التحقق من التعيينات أعلاه.")
+            st.stop()
+        else:
+            st.success("✅ تم تعيين جميع الأعمدة بنجاح!")
+
+    st.subheader("📌 التعيينات النهائية")
+    mapping_df = pd.DataFrame([
+        {"العمود القياسي": STANDARD_COLUMNS[std], "العمود في الملف": orig if orig else "❌ مفقود"}
+        for std, orig in mapping.items()
+    ])
+    st.table(mapping_df)
+
+    if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
+        with st.spinner("جاري تحليل البيانات..."):
+            df_clean, stats = cached_calculate(df, tuple(mapping.items()))
+
+            st.subheader("📈 لوحة التحليل")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("إجمالي مرات الظهور", f"{stats['total_impressions']:,.0f}")
+            col2.metric("إجمالي النقرات", f"{stats['total_clicks']:,.0f}")
+            col3.metric("إجمالي الإنفاق", f"${stats['total_spend']:,.2f}")
+            col4.metric("إجمالي التحويلات", f"{stats['total_conversions']:,.0f}")
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("متوسط CTR", f"{stats['avg_CTR']:.2f}%")
+            col2.metric("متوسط CPC", f"${stats['avg_CPC']:.2f}")
+            col3.metric("متوسط CPA", f"${stats['avg_CPA']:.2f}")
+            col4.metric("متوسط ROAS", f"{stats['avg_ROAS']:.2f}")
+
+            st.markdown(f"**🏆 أفضل حملة:** {stats['best_campaign']}")
+            st.markdown(f"**📉 أسوأ حملة:** {stats['worst_campaign']}")
+
+            ai_summary_text = None
+            ai_recommendations_text = None
+            ai_error = None
+
+            if model_option is not None:
+                if st.session_state.get('api_key_encrypted'):
+                    with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
+                        ai_summary_text, ai_recommendations_text, ai_error = generate_ai_summary_safe(stats, model=model_option)
+                else:
+                    ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
             else:
-                st.success("✅ تم تعيين جميع الأعمدة بنجاح!")
+                ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
 
-        st.subheader("📌 التعيينات النهائية")
-        mapping_df = pd.DataFrame([
-            {"العمود القياسي": STANDARD_COLUMNS[std], "العمود في الملف": orig if orig else "❌ مفقود"}
-            for std, orig in mapping.items()
-        ])
-        st.table(mapping_df)
+            st.subheader("🧠 الملخص التنفيذي")
+            if ai_summary_text:
+                st.markdown(ai_summary_text)
+            else:
+                st.markdown(generate_default_summary(stats))
+                if ai_error:
+                    st.warning(ai_error)
 
-        if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
-            with st.spinner("جاري تحليل البيانات..."):
-                df_clean, stats = cached_calculate(df, tuple(mapping.items()))
+            if ai_recommendations_text:
+                st.subheader("📌 التوصيات العملية")
+                st.markdown(ai_recommendations_text)
 
-                st.subheader("📈 لوحة التحليل")
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("إجمالي مرات الظهور", f"{stats['total_impressions']:,.0f}")
-                col2.metric("إجمالي النقرات", f"{stats['total_clicks']:,.0f}")
-                col3.metric("إجمالي الإنفاق", f"${stats['total_spend']:,.2f}")
-                col4.metric("إجمالي التحويلات", f"{stats['total_conversions']:,.0f}")
+            st.subheader("📥 تحميل التقرير")
+            if st.button("إنشاء PDF"):
+                with st.spinner("جاري إنشاء ملف PDF..."):
+                    pdf_buffer = generate_pdf_report(df_clean, stats, ai_summary_text, ai_recommendations_text, st.session_state['logo_path'])
+                    st.download_button(
+                        label="📄 تحميل التقرير (PDF)",
+                        data=pdf_buffer,
+                        file_name=f"AdInsight_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf"
+                    )
 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("متوسط CTR", f"{stats['avg_CTR']:.2f}%")
-                col2.metric("متوسط CPC", f"${stats['avg_CPC']:.2f}")
-                col3.metric("متوسط CPA", f"${stats['avg_CPA']:.2f}")
-                col4.metric("متوسط ROAS", f"{stats['avg_ROAS']:.2f}")
+            st.subheader("📥 تحميل Excel")
+            excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
+            st.download_button(
+                label="📊 تحميل Excel (مع ورقة Summary، صيغ ديناميكية، حماية، تنسيق أرقام، تنسيق شرطي، جدول احترافي)",
+                data=excel_output,
+                file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-                st.markdown(f"**🏆 أفضل حملة:** {stats['best_campaign']}")
-                st.markdown(f"**📉 أسوأ حملة:** {stats['worst_campaign']}")
-
-                ai_summary_text = None
-                ai_recommendations_text = None
-                ai_error = None
-
-                if model_option is not None:
-                    if st.session_state.get('api_key_encrypted'):
-                        with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
-                            ai_summary_text, ai_recommendations_text, ai_error = generate_ai_summary_safe(stats, model=model_option)
-                    else:
-                        ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
+    with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
+        st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
+        code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")
+        if st.button("تشغيل الكود"):
+            try:
+                if 'df_clean' in locals():
+                    df_to_use = df_clean
                 else:
-                    ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
-
-                st.subheader("🧠 الملخص التنفيذي")
-                if ai_summary_text:
-                    st.markdown(ai_summary_text)
+                    df_to_use = df
+                res = executor.execute(code_input, df_to_use)
+                if isinstance(res, dict) and "error" in res:
+                    st.error(f"خطأ: {res['error']}")
                 else:
-                    st.markdown(generate_default_summary(stats))
-                    if ai_error:
-                        st.warning(ai_error)
-
-                if ai_recommendations_text:
-                    st.subheader("📌 التوصيات العملية")
-                    st.markdown(ai_recommendations_text)
-
-                st.subheader("📥 تحميل التقرير")
-                if st.button("إنشاء PDF"):
-                    with st.spinner("جاري إنشاء ملف PDF..."):
-                        pdf_buffer = generate_pdf_report(df_clean, stats, ai_summary_text, ai_recommendations_text, st.session_state['logo_path'])
-                        st.download_button(
-                            label="📄 تحميل التقرير (PDF)",
-                            data=pdf_buffer,
-                            file_name=f"AdInsight_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                            mime="application/pdf"
-                        )
-
-                st.subheader("📥 تحميل Excel")
-                excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
-                st.download_button(
-                    label="📊 تحميل Excel (مع ورقة Summary، صيغ ديناميكية، حماية، تنسيق أرقام، تنسيق شرطي، جدول احترافي)",
-                    data=excel_output,
-                    file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-        with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
-            st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
-            code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")
-            if st.button("تشغيل الكود"):
-                try:
-                    if 'df_clean' in locals():
-                        df_to_use = df_clean
-                    else:
-                        df_to_use = df
-                    res = executor.execute(code_input, df_to_use)
-                    if isinstance(res, dict) and "error" in res:
-                        st.error(f"خطأ: {res['error']}")
-                    else:
-                        st.success("تم التنفيذ بنجاح.")
-                        st.write("النتيجة:", res)
-                except Exception as e:
-                    st.error(f"خطأ غير متوقع: {e}")
+                    st.success("تم التنفيذ بنجاح.")
+                    st.write("النتيجة:", res)
+            except Exception as e:
+                st.error(f"خطأ غير متوقع: {e}")
 
 if __name__ == "__main__":
     main()

@@ -474,6 +474,11 @@ def cached_calculate(df, mapping_tuple):
     mapping = dict(mapping_tuple)
     return calculate_kpis(df, mapping)
 
+# ---------------------------- دوال التخزين المؤقت للملفات ----------------------------
+def get_file_hash(uploaded_file):
+    """توليد بصمة MD5 للمحتوى (آمن للملفات حتى 200MB تقريباً)."""
+    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
+
 # ---------------------------- دالة تصدير Excel المحسّنة ----------------------------
 def export_excel_with_summary(df_clean, user_password=None):
     from openpyxl.styles import Font, PatternFill, Alignment, Protection
@@ -988,22 +993,56 @@ def render_trial_notifications():
         for msg in notifications:
             st.sidebar.warning(msg)
 
+# ---------------------------- تهيئة الجلسة ----------------------------
+def init_session():
+    if "df" not in st.session_state:
+        st.session_state.df = None
+    if "last_file_hash" not in st.session_state:
+        st.session_state.last_file_hash = None
+    if "mapping" not in st.session_state:
+        st.session_state.mapping = None
+    if "run_analysis" not in st.session_state:
+        st.session_state.run_analysis = False
+    if "stats" not in st.session_state:
+        st.session_state.stats = None
+    if "df_clean" not in st.session_state:
+        st.session_state.df_clean = None
+
+# ---------------------------- قسم رفع الملف الذكي ----------------------------
+def upload_section():
+    uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx', 'xls'])
+
+    if uploaded_file:
+        current_hash = get_file_hash(uploaded_file)
+
+        if st.session_state.last_file_hash != current_hash:
+            try:
+                df, file_type = load_file_smart(uploaded_file)
+
+                st.session_state.df = df
+                st.session_state.last_file_hash = current_hash
+                st.session_state.mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
+                # إعادة ضبط حالة التحليل لأن البيانات تغيرت
+                st.session_state.run_analysis = False
+                st.session_state.stats = None
+                st.session_state.df_clean = None
+
+                st.success("✅ تم التعرف على ملف جديد ومعالجته بنجاح.")
+            except Exception as e:
+                st.error(f"❌ حدث خطأ أثناء المعالجة: {e}")
+                st.stop()
+
 # ---------------------------- واجهة Streamlit ----------------------------
 def main():
     st.set_page_config(page_title="AdInsight AI", layout="wide")
-    
-    # تهيئة حالة الجلسة
-    if "uploaded_file_name" not in st.session_state:
-        st.session_state.uploaded_file_name = None
-    if "df" not in st.session_state:
-        st.session_state.df = None
-    if "mapping" not in st.session_state:
-        st.session_state.mapping = None
+
+    # تهيئة الجلسة
+    init_session()
 
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    # التحقق من الترخيص (مع مراعاة DEV_MODE)
+    # -------------------- التحقق من الترخيص --------------------
     is_allowed, message = check_license_secure_with_trial()
 
     if not is_allowed:
@@ -1016,7 +1055,7 @@ def main():
         else:
             st.info(message)
 
-    # عرض حالة الترخيص
+    # -------------------- عرض حالة الترخيص --------------------
     try:
         data = load_client_data_encrypted()
         render_license_status(data)
@@ -1025,6 +1064,7 @@ def main():
             st.sidebar.info("🔓 وضع التطوير: الترخيش غير مفعل.")
     render_trial_notifications()
 
+    # -------------------- إعدادات الشريط الجانبي --------------------
     if 'api_key_encrypted' not in st.session_state:
         st.session_state['api_key_encrypted'] = None
     if 'logo_path' not in st.session_state:
@@ -1032,7 +1072,7 @@ def main():
 
     with st.sidebar:
         st.header("الإعدادات")
-        
+
         logo_file = st.file_uploader("شعار العميل (اختياري - White Label)", type=['png', 'jpg', 'jpeg'])
         if logo_file is not None:
             if st.session_state['logo_path'] and os.path.exists(st.session_state['logo_path']):
@@ -1080,35 +1120,22 @@ def main():
         st.markdown("---")
         st.caption("AdInsight AI - جميع الحقوق محفوظة © 2026")
 
-    # رفع الملف
-    uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx', 'xls'])
+    # -------------------- رفع الملف --------------------
+    upload_section()
 
-    if uploaded_file is not None:
-        # إذا كان الملف مختلفاً عن المخزن، نقوم بتحميله
-        if uploaded_file.name != st.session_state.uploaded_file_name:
-            try:
-                df, file_type = load_file_smart(uploaded_file)
-                st.session_state.df = df
-                st.session_state.mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
-                st.session_state.uploaded_file_name = uploaded_file.name
-                st.success("✅ تم تحميل الملف بنجاح")
-            except Exception as e:
-                st.error(f"❌ فشل تحميل الملف: {e}")
-                st.stop()
-
-    # استعادة البيانات من الجلسة
+    # استرجاع البيانات من الجلسة
     df = st.session_state.df
     mapping = st.session_state.mapping
 
-    # إذا لم توجد بيانات، نطلب رفع ملف
-    if df is None or mapping is None:
+    if df is None:
         st.info("📁 يرجى رفع ملف للبدء.")
         st.stop()
 
-    # بقية التطبيق (عرض عينة، تعيين الأعمدة المفقودة، التحليل، إلخ)
+    # -------------------- بعد التحميل --------------------
     st.subheader("🔍 عينة من البيانات المرفوعة")
     st.dataframe(df.head())
 
+    # التحقق من الأعمدة المفقودة
     missing = validate_mapping(mapping, REQUIRED_COLUMNS)
 
     if missing:
@@ -1144,75 +1171,82 @@ def main():
     if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
         with st.spinner("جاري تحليل البيانات..."):
             df_clean, stats = cached_calculate(df, tuple(mapping.items()))
+            st.session_state.df_clean = df_clean
+            st.session_state.stats = stats
+            st.session_state.run_analysis = True
 
-            st.subheader("📈 لوحة التحليل")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("إجمالي مرات الظهور", f"{stats['total_impressions']:,.0f}")
-            col2.metric("إجمالي النقرات", f"{stats['total_clicks']:,.0f}")
-            col3.metric("إجمالي الإنفاق", f"${stats['total_spend']:,.2f}")
-            col4.metric("إجمالي التحويلات", f"{stats['total_conversions']:,.0f}")
+    if st.session_state.run_analysis and st.session_state.df_clean is not None:
+        df_clean = st.session_state.df_clean
+        stats = st.session_state.stats
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("متوسط CTR", f"{stats['avg_CTR']:.2f}%")
-            col2.metric("متوسط CPC", f"${stats['avg_CPC']:.2f}")
-            col3.metric("متوسط CPA", f"${stats['avg_CPA']:.2f}")
-            col4.metric("متوسط ROAS", f"{stats['avg_ROAS']:.2f}")
+        st.subheader("📈 لوحة التحليل")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("إجمالي مرات الظهور", f"{stats['total_impressions']:,.0f}")
+        col2.metric("إجمالي النقرات", f"{stats['total_clicks']:,.0f}")
+        col3.metric("إجمالي الإنفاق", f"${stats['total_spend']:,.2f}")
+        col4.metric("إجمالي التحويلات", f"{stats['total_conversions']:,.0f}")
 
-            st.markdown(f"**🏆 أفضل حملة:** {stats['best_campaign']}")
-            st.markdown(f"**📉 أسوأ حملة:** {stats['worst_campaign']}")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("متوسط CTR", f"{stats['avg_CTR']:.2f}%")
+        col2.metric("متوسط CPC", f"${stats['avg_CPC']:.2f}")
+        col3.metric("متوسط CPA", f"${stats['avg_CPA']:.2f}")
+        col4.metric("متوسط ROAS", f"{stats['avg_ROAS']:.2f}")
 
-            ai_summary_text = None
-            ai_recommendations_text = None
-            ai_error = None
+        st.markdown(f"**🏆 أفضل حملة:** {stats['best_campaign']}")
+        st.markdown(f"**📉 أسوأ حملة:** {stats['worst_campaign']}")
 
-            if model_option is not None:
-                if st.session_state.get('api_key_encrypted'):
-                    with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
-                        ai_summary_text, ai_recommendations_text, ai_error = generate_ai_summary_safe(stats, model=model_option)
-                else:
-                    ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
+        ai_summary_text = None
+        ai_recommendations_text = None
+        ai_error = None
+
+        if model_option is not None:
+            if st.session_state.get('api_key_encrypted'):
+                with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
+                    ai_summary_text, ai_recommendations_text, ai_error = generate_ai_summary_safe(stats, model=model_option)
             else:
-                ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
+                ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
+        else:
+            ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
 
-            st.subheader("🧠 الملخص التنفيذي")
-            if ai_summary_text:
-                st.markdown(ai_summary_text)
-            else:
-                st.markdown(generate_default_summary(stats))
-                if ai_error:
-                    st.warning(ai_error)
+        st.subheader("🧠 الملخص التنفيذي")
+        if ai_summary_text:
+            st.markdown(ai_summary_text)
+        else:
+            st.markdown(generate_default_summary(stats))
+            if ai_error:
+                st.warning(ai_error)
 
-            if ai_recommendations_text:
-                st.subheader("📌 التوصيات العملية")
-                st.markdown(ai_recommendations_text)
+        if ai_recommendations_text:
+            st.subheader("📌 التوصيات العملية")
+            st.markdown(ai_recommendations_text)
 
-            st.subheader("📥 تحميل التقرير")
-            if st.button("إنشاء PDF"):
-                with st.spinner("جاري إنشاء ملف PDF..."):
-                    pdf_buffer = generate_pdf_report(df_clean, stats, ai_summary_text, ai_recommendations_text, st.session_state['logo_path'])
-                    st.download_button(
-                        label="📄 تحميل التقرير (PDF)",
-                        data=pdf_buffer,
-                        file_name=f"AdInsight_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf"
-                    )
+        st.subheader("📥 تحميل التقرير")
+        if st.button("إنشاء PDF"):
+            with st.spinner("جاري إنشاء ملف PDF..."):
+                pdf_buffer = generate_pdf_report(df_clean, stats, ai_summary_text, ai_recommendations_text, st.session_state['logo_path'])
+                st.download_button(
+                    label="📄 تحميل التقرير (PDF)",
+                    data=pdf_buffer,
+                    file_name=f"AdInsight_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf"
+                )
 
-            st.subheader("📥 تحميل Excel")
-            excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
-            st.download_button(
-                label="📊 تحميل Excel (مع ورقة Summary، صيغ ديناميكية، حماية، تنسيق أرقام، تنسيق شرطي، جدول احترافي)",
-                data=excel_output,
-                file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        st.subheader("📥 تحميل Excel")
+        excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
+        st.download_button(
+            label="📊 تحميل Excel (مع ورقة Summary، صيغ ديناميكية، حماية، تنسيق أرقام، تنسيق شرطي، جدول احترافي)",
+            data=excel_output,
+            file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
         st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
         code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")
         if st.button("تشغيل الكود"):
             try:
-                if 'df_clean' in locals():
-                    df_to_use = df_clean
+                if st.session_state.df_clean is not None:
+                    df_to_use = st.session_state.df_clean
                 else:
                     df_to_use = df
                 res = executor.execute(code_input, df_to_use)

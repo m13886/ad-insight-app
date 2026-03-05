@@ -476,7 +476,6 @@ def cached_calculate(df, mapping_tuple):
 
 # ---------------------------- دوال التخزين المؤقت للملفات ----------------------------
 def get_file_hash(uploaded_file):
-    """توليد بصمة MD5 للمحتوى (آمن للملفات حتى 200MB تقريباً)."""
     return hashlib.md5(uploaded_file.getvalue()).hexdigest()
 
 # ---------------------------- دالة تصدير Excel المحسّنة ----------------------------
@@ -993,22 +992,25 @@ def render_trial_notifications():
         for msg in notifications:
             st.sidebar.warning(msg)
 
-# ---------------------------- تهيئة الجلسة ----------------------------
+# ---------------------------- تهيئة الجلسة (محدثة) ----------------------------
 def init_session():
-    if "df" not in st.session_state:
-        st.session_state.df = None
-    if "last_file_hash" not in st.session_state:
-        st.session_state.last_file_hash = None
-    if "mapping" not in st.session_state:
-        st.session_state.mapping = None
-    if "run_analysis" not in st.session_state:
-        st.session_state.run_analysis = False
-    if "stats" not in st.session_state:
-        st.session_state.stats = None
-    if "df_clean" not in st.session_state:
-        st.session_state.df_clean = None
+    defaults = {
+        "df": None,
+        "last_file_hash": None,
+        "mapping": None,
+        "run_analysis": False,
+        "stats": None,
+        "df_clean": None,
+        "ai_summary": None,
+        "ai_recs": None,
+        "ai_error": None,
+        "pdf_buffer": None
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# ---------------------------- قسم رفع الملف الذكي ----------------------------
+# ---------------------------- قسم رفع الملف الذكي (محدث) ----------------------------
 def upload_section():
     uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx', 'xls'])
 
@@ -1022,10 +1024,15 @@ def upload_section():
                 st.session_state.df = df
                 st.session_state.last_file_hash = current_hash
                 st.session_state.mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
-                # إعادة ضبط حالة التحليل لأن البيانات تغيرت
+
+                # إعادة ضبط حالة التحليل والنتائج السابقة لأن البيانات تغيرت
                 st.session_state.run_analysis = False
                 st.session_state.stats = None
                 st.session_state.df_clean = None
+                st.session_state.ai_summary = None
+                st.session_state.ai_recs = None
+                st.session_state.ai_error = None
+                st.session_state.pdf_buffer = None
 
                 st.success("✅ تم التعرف على ملف جديد ومعالجته بنجاح.")
             except Exception as e:
@@ -1168,14 +1175,39 @@ def main():
     ])
     st.table(mapping_df)
 
+    # -------------------- زر التشغيل الرئيسي --------------------
     if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
-        with st.spinner("جاري تحليل البيانات..."):
-            df_clean, stats = cached_calculate(df, tuple(mapping.items()))
-            st.session_state.df_clean = df_clean
-            st.session_state.stats = stats
-            st.session_state.run_analysis = True
+        st.session_state.run_analysis = True
+        st.session_state.stats = None          # تصفير لإجبار إعادة الحساب
+        st.session_state.df_clean = None
+        st.session_state.ai_summary = None
+        st.session_state.ai_recs = None
+        st.session_state.ai_error = None
+        st.session_state.pdf_buffer = None     # تصفير لإعادة توليد التقرير الجديد
 
-    if st.session_state.run_analysis and st.session_state.df_clean is not None:
+    # -------------------- عرض النتائج --------------------
+    if st.session_state.run_analysis:
+
+        # 1. تنفيذ الحسابات مرة واحدة فقط
+        if st.session_state.stats is None:
+            with st.spinner("جاري تحليل البيانات..."):
+                df_clean, stats = cached_calculate(df, tuple(mapping.items()))
+                st.session_state.df_clean = df_clean
+                st.session_state.stats = stats
+
+            # 2. تنفيذ استدعاء الذكاء الاصطناعي مرة واحدة فقط
+            if model_option is not None:
+                if st.session_state.get('api_key_encrypted'):
+                    with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
+                        summ, recs, err = generate_ai_summary_safe(stats, model=model_option)
+                        st.session_state.ai_summary = summ
+                        st.session_state.ai_recs = recs
+                        st.session_state.ai_error = err
+                else:
+                    st.session_state.ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
+            else:
+                st.session_state.ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
+
         df_clean = st.session_state.df_clean
         stats = st.session_state.stats
 
@@ -1195,51 +1227,54 @@ def main():
         st.markdown(f"**🏆 أفضل حملة:** {stats['best_campaign']}")
         st.markdown(f"**📉 أسوأ حملة:** {stats['worst_campaign']}")
 
-        ai_summary_text = None
-        ai_recommendations_text = None
-        ai_error = None
-
-        if model_option is not None:
-            if st.session_state.get('api_key_encrypted'):
-                with st.spinner("🧠 جاري توليد الملخص بالذكاء الاصطناعي..."):
-                    ai_summary_text, ai_recommendations_text, ai_error = generate_ai_summary_safe(stats, model=model_option)
-            else:
-                ai_error = "❌ مفتاح API غير موجود. يرجى إدخاله في الشريط الجانبي."
-        else:
-            ai_error = "ℹ️ الباقة الحالية لا تدعم الذكاء الاصطناعي. استخدم الملخص الافتراضي."
-
         st.subheader("🧠 الملخص التنفيذي")
-        if ai_summary_text:
-            st.markdown(ai_summary_text)
+        if st.session_state.ai_summary:
+            st.markdown(st.session_state.ai_summary)
         else:
             st.markdown(generate_default_summary(stats))
-            if ai_error:
-                st.warning(ai_error)
+            if st.session_state.ai_error:
+                st.warning(st.session_state.ai_error)
 
-        if ai_recommendations_text:
+        if st.session_state.ai_recs:
             st.subheader("📌 التوصيات العملية")
-            st.markdown(ai_recommendations_text)
+            st.markdown(st.session_state.ai_recs)
 
-        st.subheader("📥 تحميل التقرير")
-        if st.button("إنشاء PDF"):
-            with st.spinner("جاري إنشاء ملف PDF..."):
-                pdf_buffer = generate_pdf_report(df_clean, stats, ai_summary_text, ai_recommendations_text, st.session_state['logo_path'])
+        st.markdown("---")
+        st.subheader("📥 تحميل التقارير")
+        col_pdf, col_excel = st.columns(2)
+
+        # إصلاح مشكلة زر الـ PDF
+        with col_pdf:
+            if st.session_state.pdf_buffer is None:
+                if st.button("📝 تجهيز تقرير PDF"):
+                    with st.spinner("جاري التجهيز..."):
+                        st.session_state.pdf_buffer = generate_pdf_report(
+                            df_clean, stats,
+                            st.session_state.ai_summary,
+                            st.session_state.ai_recs,
+                            st.session_state.get('logo_path')
+                        )
+                        st.rerun()   # لإظهار زر التحميل
+
+            if st.session_state.pdf_buffer:
                 st.download_button(
                     label="📄 تحميل التقرير (PDF)",
-                    data=pdf_buffer,
+                    data=st.session_state.pdf_buffer,
                     file_name=f"AdInsight_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                     mime="application/pdf"
                 )
 
-        st.subheader("📥 تحميل Excel")
-        excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
-        st.download_button(
-            label="📊 تحميل Excel (مع ورقة Summary، صيغ ديناميكية، حماية، تنسيق أرقام، تنسيق شرطي، جدول احترافي)",
-            data=excel_output,
-            file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # زر تحميل Excel (يعمل بسلاسة لأنه لا يتطلب استدعاء خارجي ثقيل)
+        with col_excel:
+            excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
+            st.download_button(
+                label="📊 تحميل تقرير Excel",
+                data=excel_output,
+                file_name=f"AdInsight_Analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
+    # -------------------- قسم تحليل مخصص (كود بايثون آمن) --------------------
     with st.expander("🧪 تحليل مخصص (كود بايثون آمن)"):
         st.markdown("اكتب كود بايثون لمعالجة DataFrame الحالي (`df`). يجب أن يخزن النتيجة في متغير `result`.")
         code_input = st.text_area("الكود", height=200, value="# مثال: result = df.head(10)")

@@ -141,7 +141,9 @@ def load_client_data_encrypted():
         )
 
 def is_trial_valid(data):
+    """التحقق من صحة النسخة التجريبية (دون تعديل العداد)."""
     if "device_id" not in data or data["device_id"] is None:
+        # إصلاح تلقائي للملفات القديمة
         data["device_id"] = get_device_id()
         save_client_data_encrypted(data)
 
@@ -166,10 +168,7 @@ def is_trial_valid(data):
     if usage >= limit:
         return False, f"⛔ انتهت النسخة التجريبية (استخدمت {usage} من أصل {limit} استخدامات)."
 
-    data["usage_count"] = usage + 1
-    save_client_data_encrypted(data)
-
-    remaining_usage = limit - (usage + 1)
+    remaining_usage = limit - usage
     remaining_days = trial_days - days_passed
     return True, f"⚠️ نسخة تجريبية: {remaining_usage} استخدامات متبقية، {remaining_days} أيام متبقية"
 
@@ -1012,7 +1011,11 @@ def init_session():
 
 # ---------------------------- قسم رفع الملف الذكي (محدث) ----------------------------
 def upload_section():
-    uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=['csv', 'xlsx', 'xls'])
+    uploaded_file = st.file_uploader(
+        "ارفع ملف CSV أو Excel",
+        type=['csv', 'xlsx', 'xls'],
+        key="file_u_main"          # <-- مفتاح ثابت لمنع فقدان المرجع
+    )
 
     if uploaded_file:
         current_hash = get_file_hash(uploaded_file)
@@ -1035,6 +1038,7 @@ def upload_section():
                 st.session_state.pdf_buffer = None
 
                 st.success("✅ تم التعرف على ملف جديد ومعالجته بنجاح.")
+                st.rerun()          # <-- إعادة تشغيل فورية لتثبيت البيانات
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء المعالجة: {e}")
                 st.stop()
@@ -1049,20 +1053,19 @@ def main():
     st.title("📊 AdInsight AI - مولد تقارير الحملات الإعلانية مع الذكاء الاصطناعي")
     st.markdown("---")
 
-    # -------------------- التحقق من الترخيص --------------------
-    is_allowed, message = check_license_secure_with_trial()
-
+    # -------------------- التحقق من الترخيص (مرة واحدة في بداية الجلسة) --------------------
+    is_allowed, auth_msg = check_license_secure_with_trial()
     if not is_allowed:
-        st.error(f"⛔ {message}")
+        st.error(f"⛔ {auth_msg}")
         render_license_activation()
         st.stop()
     else:
         if DEV_MODE:
             st.info("🚧 وضع التطوير: الترخيص غير مفعل.")
         else:
-            st.info(message)
+            st.info(auth_msg)
 
-    # -------------------- عرض حالة الترخيص --------------------
+    # -------------------- عرض حالة الترخيص والتنبيهات --------------------
     try:
         data = load_client_data_encrypted()
         render_license_status(data)
@@ -1177,6 +1180,13 @@ def main():
 
     # -------------------- زر التشغيل الرئيسي --------------------
     if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
+        # زيادة عداد الاستخدامات فقط عند بدء التحليل الفعلي
+        if not DEV_MODE:
+            data = load_client_data_encrypted()
+            if data.get("license_status") == "trial":
+                data["usage_count"] += 1
+                save_client_data_encrypted(data)
+
         st.session_state.run_analysis = True
         st.session_state.stats = None          # تصفير لإجبار إعادة الحساب
         st.session_state.df_clean = None
@@ -1184,6 +1194,7 @@ def main():
         st.session_state.ai_recs = None
         st.session_state.ai_error = None
         st.session_state.pdf_buffer = None     # تصفير لإعادة توليد التقرير الجديد
+        st.rerun()
 
     # -------------------- عرض النتائج --------------------
     if st.session_state.run_analysis:
@@ -1264,7 +1275,7 @@ def main():
                     mime="application/pdf"
                 )
 
-        # زر تحميل Excel (يعمل بسلاسة لأنه لا يتطلب استدعاء خارجي ثقيل)
+        # زر تحميل Excel
         with col_excel:
             excel_output = export_excel_with_summary(df_clean, user_password=excel_password if excel_password else None)
             st.download_button(

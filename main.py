@@ -140,19 +140,20 @@ def load_client_data_encrypted():
             f"التفاصيل: {e}"
         )
 
-def is_trial_valid(data):
-    """التحقق من صحة النسخة التجريبية (دون تعديل العداد)."""
-    if "device_id" not in data or data["device_id"] is None:
-        # إصلاح تلقائي للملفات القديمة
-        data["device_id"] = get_device_id()
-        save_client_data_encrypted(data)
+@st.cache_data(ttl=600)
+def load_client_data_cached():
+    return load_client_data_encrypted()
 
-    if data["device_id"] != get_device_id():
-        return False, "⛔ النسخة التجريبية مرتبطة بجهاز آخر ولا يمكن استخدامها هنا."
+def is_trial_valid(data):
+    """التحقق من صحة النسخة التجريبية (بدون تعديل البيانات)."""
+    device_id = data.get("device_id")
+    if device_id != get_device_id():
+        return False, "⛔ النسخة التجريبية مرتبطة بجهاز آخر."
 
     first_use_str = data.get("first_use")
     if not first_use_str:
-        return False, "⛔ بيانات النسخة التجريبية غير صالحة (first_use مفقود)."
+        return False, "⛔ بيانات النسخة التجريبية غير صالحة."
+
     try:
         first_use = datetime.datetime.fromisoformat(first_use_str)
     except:
@@ -254,6 +255,7 @@ def verify_license_signature() -> bool:
     return hmac.compare_digest(sig, expected_sig)
 
 def check_license_secure_with_trial():
+    """التحقق من الترخيص مع حماية التزوير ومدة النسخة التجريبية (بدون تعديل البيانات)."""
     if DEV_MODE:
         return True, "⚠️ وضع التطوير: تم تجاوز التحقق من الترخيص."
 
@@ -1014,10 +1016,10 @@ def upload_section():
     uploaded_file = st.file_uploader(
         "ارفع ملف CSV أو Excel",
         type=['csv', 'xlsx', 'xls'],
-        key="file_u_main"          # <-- مفتاح ثابت لمنع فقدان المرجع
+        key="main_data_uploader"          # مفتاح ثابت
     )
 
-    if uploaded_file:
+    if uploaded_file is not None:
         current_hash = get_file_hash(uploaded_file)
 
         if st.session_state.last_file_hash != current_hash:
@@ -1028,20 +1030,16 @@ def upload_section():
                 st.session_state.last_file_hash = current_hash
                 st.session_state.mapping = auto_map_columns_smart(df, SYNONYMS, STANDARD_COLUMNS)
 
-                # إعادة ضبط حالة التحليل والنتائج السابقة لأن البيانات تغيرت
+                # تصفير النتائج القديمة
                 st.session_state.run_analysis = False
                 st.session_state.stats = None
                 st.session_state.df_clean = None
                 st.session_state.ai_summary = None
-                st.session_state.ai_recs = None
-                st.session_state.ai_error = None
                 st.session_state.pdf_buffer = None
 
-                st.success("✅ تم التعرف على ملف جديد ومعالجته بنجاح.")
-                st.rerun()          # <-- إعادة تشغيل فورية لتثبيت البيانات
+                st.success("✅ تم تحميل البيانات وتحديث الحالة بنجاح.")
             except Exception as e:
-                st.error(f"❌ حدث خطأ أثناء المعالجة: {e}")
-                st.stop()
+                st.error(f"❌ خطأ في المعالجة: {e}")
 
 # ---------------------------- واجهة Streamlit ----------------------------
 def main():
@@ -1083,16 +1081,19 @@ def main():
     with st.sidebar:
         st.header("الإعدادات")
 
-        logo_file = st.file_uploader("شعار العميل (اختياري - White Label)", type=['png', 'jpg', 'jpeg'])
+        logo_file = st.file_uploader(
+            "شعار العميل (اختياري)",
+            type=['png', 'jpg', 'jpeg'],
+            key="logo_uploader"                # مفتاح ثابت
+        )
+
         if logo_file is not None:
-            if st.session_state['logo_path'] and os.path.exists(st.session_state['logo_path']):
-                os.remove(st.session_state['logo_path'])
-            logo_filename = os.path.join(tempfile.gettempdir(), f"temp_logo_{uuid.uuid4().hex}.png")
-            with open(logo_filename, "wb") as f:
-                f.write(logo_file.getbuffer())
-            st.session_state['logo_path'] = logo_filename
-        else:
-            st.session_state['logo_path'] = None
+            # نحفظ فقط إذا لم يكن مخزناً بالفعل
+            if 'logo_path' not in st.session_state or st.session_state['logo_path'] is None:
+                logo_filename = os.path.join(tempfile.gettempdir(), f"temp_logo_{uuid.uuid4().hex}.png")
+                with open(logo_filename, "wb") as f:
+                    f.write(logo_file.getbuffer())
+                st.session_state['logo_path'] = logo_filename
 
         st.markdown("---")
         st.subheader("🔑 مفتاح OpenAI API")
@@ -1180,21 +1181,19 @@ def main():
 
     # -------------------- زر التشغيل الرئيسي --------------------
     if st.button("🚀 تحليل البيانات وإنشاء التقرير"):
-        # زيادة عداد الاستخدامات فقط عند بدء التحليل الفعلي
-        if not DEV_MODE:
-            data = load_client_data_encrypted()
-            if data.get("license_status") == "trial":
-                data["usage_count"] += 1
-                save_client_data_encrypted(data)
-
+        # زيادة العداد فقط إذا كان في الوضع التجريبي
+        data = load_client_data_encrypted()
+        if data.get("license_status") == "trial":
+            data["usage_count"] += 1
+            save_client_data_encrypted(data)
         st.session_state.run_analysis = True
-        st.session_state.stats = None          # تصفير لإجبار إعادة الحساب
+        # تصفير الحالات القديمة
+        st.session_state.stats = None
         st.session_state.df_clean = None
         st.session_state.ai_summary = None
         st.session_state.ai_recs = None
         st.session_state.ai_error = None
-        st.session_state.pdf_buffer = None     # تصفير لإعادة توليد التقرير الجديد
-        st.rerun()
+        st.session_state.pdf_buffer = None
 
     # -------------------- عرض النتائج --------------------
     if st.session_state.run_analysis:
@@ -1265,7 +1264,7 @@ def main():
                             st.session_state.ai_recs,
                             st.session_state.get('logo_path')
                         )
-                        st.rerun()   # لإظهار زر التحميل
+                        st.rerun()
 
             if st.session_state.pdf_buffer:
                 st.download_button(
